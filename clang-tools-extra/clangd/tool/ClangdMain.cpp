@@ -68,6 +68,10 @@ namespace clangd {
 bool check(const llvm::StringRef File, const ThreadsafeFS &TFS,
            const ClangdLSPServer::Options &Opts);
 
+// Implemented in BuildIndex.cpp.
+bool buildIndex(const ThreadsafeFS &TFS,
+                const ClangdLSPServer::Options &Opts);
+
 namespace {
 
 using llvm::cl::cat;
@@ -170,6 +174,16 @@ opt<bool> EnableBackgroundIndex{
     cat(Features),
     desc("Index project code in the background and persist index on disk."),
     init(true),
+};
+
+opt<bool> BuildIndex{
+    "build-index",
+    cat(Features),
+    desc("Build or update the background index cache and exit. "
+         "Instead of running as a language server, discovers all translation "
+         "units from the compilation database, indexes them, writes the cache "
+         "to .cache/clangd/index/, and exits. Progress is printed to stdout."),
+    init(false),
 };
 
 opt<llvm::ThreadPriority> BackgroundIndexPriority{
@@ -1028,6 +1042,11 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
     return check(Path, TFS, Opts)
                ? 0
                : static_cast<int>(ErrorResultCode::CheckFailed);
+  }
+
+  if (BuildIndex) {
+    log("Entering build-index mode (no LSP server)");
+    return buildIndex(TFS, Opts) ? 0 : 1;
   }
 
   FeatureModuleSet ModuleSet = FeatureModuleSet::fromRegistry();
