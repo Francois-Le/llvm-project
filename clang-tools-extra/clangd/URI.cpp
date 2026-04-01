@@ -276,5 +276,38 @@ llvm::Expected<std::string> URI::includeSpelling(const URI &Uri) {
   return S->get()->getIncludeSpelling(Uri);
 }
 
+llvm::Expected<std::string> uriToRelativePath(llvm::StringRef FileURI,
+                                              llvm::StringRef ProjectRoot) {
+  assert(!ProjectRoot.empty());
+  auto ParsedURI = URI::parse(FileURI);
+  if (!ParsedURI)
+    return ParsedURI.takeError();
+  if (ParsedURI->scheme() != "file")
+    return error("Can not relativize non-file URI: '{0}'", FileURI);
+  llvm::SmallString<256> Path(ParsedURI->body());
+  // Windows: file:///X:/path -> body "/X:/path", strip leading "/"
+  if (Path.size() > 1 &&
+      llvm::sys::path::is_absolute(Path.str().substr(1),
+                                   llvm::sys::path::Style::windows))
+    Path.erase(Path.begin());
+  if (!llvm::sys::path::replace_path_prefix(Path, ProjectRoot, ""))
+    return error("File path '{0}' doesn't start with project root '{1}'",
+                 Path.str(), ProjectRoot);
+  return std::string(Path);
+}
+
+llvm::Expected<std::string> relativePathToURI(llvm::StringRef RelativePath,
+                                              llvm::StringRef ProjectRoot) {
+  assert(!ProjectRoot.empty());
+  if (RelativePath.empty())
+    return error("Empty relative path");
+  if (llvm::sys::path::is_absolute(RelativePath,
+                                   llvm::sys::path::Style::posix))
+    return error("RelativePath '{0}' is not relative", RelativePath);
+  llvm::SmallString<256> FullPath(ProjectRoot);
+  FullPath.append(RelativePath);
+  return URI::createFile(FullPath).toString();
+}
+
 } // namespace clangd
 } // namespace clang

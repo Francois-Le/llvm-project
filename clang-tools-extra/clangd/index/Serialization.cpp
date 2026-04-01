@@ -9,6 +9,7 @@
 #include "Serialization.h"
 #include "Headers.h"
 #include "RIFF.h"
+#include "URI.h"
 #include "index/MemIndex.h"
 #include "index/SymbolLocation.h"
 #include "index/SymbolOrigin.h"
@@ -21,6 +22,8 @@
 #include "llvm/Support/Compression.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/StringSaver.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdint>
 #include <vector>
@@ -457,7 +460,51 @@ readCompileCommand(Reader CmdReader, llvm::ArrayRef<llvm::StringRef> Strings) {
 // The current versioning scheme is simple - non-current versions are rejected.
 // If you make a breaking change, bump this version number to invalidate stored
 // data. Later we may want to support some backward compatibility.
-constexpr static uint32_t Version = 20;
+constexpr static uint32_t Version = 21;
+// Oldest version that can still be read (for backward compatibility).
+constexpr static uint32_t MinReadVersion = 20;
+
+// Convert a SymbolLocation's FileURI from absolute URI to relative path.
+// Silently leaves the URI unchanged if it can't be converted.
+static void convertLocationToRelative(SymbolLocation &Loc,
+                                      llvm::StringRef Root,
+                                      llvm::StringSaver &Saver) {
+  llvm::StringRef URI(Loc.FileURI);
+  if (URI.empty())
+    return;
+  auto Rel = uriToRelativePath(URI, Root);
+  if (Rel)
+    Loc.FileURI = Saver.save(*Rel).data();
+  else
+    llvm::consumeError(Rel.takeError());
+}
+
+// Convert a StringRef URI from absolute URI to relative path.
+static void convertStringToRelative(llvm::StringRef &S,
+                                    llvm::StringRef Root,
+                                    llvm::StringSaver &Saver) {
+  if (S.empty())
+    return;
+  auto Rel = uriToRelativePath(S, Root);
+  if (Rel)
+    S = Saver.save(*Rel);
+  else
+    llvm::consumeError(Rel.takeError());
+}
+
+// Expand a relative path to an absolute file:// URI. If the string already
+// looks like a URI (contains "://"), it is returned unchanged.
+static llvm::StringRef expandRelativeToURI(llvm::StringRef S,
+                                           llvm::StringRef Root,
+                                           llvm::StringSaver &Saver) {
+  if (Root.empty() || S.empty() || S.contains("://"))
+    return S;
+  auto URI = relativePathToURI(S, Root);
+  if (URI)
+    return Saver.save(*URI);
+  llvm::consumeError(URI.takeError());
+  return S;
+}
 
 llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
                                      SymbolOrigin Origin) {
@@ -475,8 +522,9 @@ llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
     return error("missing meta chunk");
   Reader Meta(Chunks.lookup("meta"));
   auto SeenVersion = Meta.consume32();
-  if (SeenVersion != Version)
-    return error("wrong version: want {0}, got {1}", Version, SeenVersion);
+  if (SeenVersion < MinReadVersion || SeenVersion > Version)
+    return error("wrong version: want {0}-{1}, got {2}", MinReadVersion,
+                 Version, SeenVersion);
 
   // meta chunk is checked above, as we prefer the "version mismatch" error.
   for (llvm::StringRef RequiredChunk : {"stri"})
@@ -487,12 +535,25 @@ llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
   if (!Strings)
     return Strings.takeError();
 
+  // Read project root for relative path expansion (v21+).
+  std::string ProjectRoot;
+  if (Chunks.count("root"))
+    ProjectRoot = Chunks.lookup("root").str();
+
+  // Allocator for expanded URI strings when converting relative paths back.
+  llvm::BumpPtrAllocator URIArena;
+  llvm::StringSaver URISaver(URIArena);
+
   IndexFileIn Result;
   if (Chunks.count("srcs")) {
     Reader SrcsReader(Chunks.lookup("srcs"));
     Result.Sources.emplace();
     while (!SrcsReader.eof()) {
       auto IGN = readIncludeGraphNode(SrcsReader, Strings->Strings);
+      // Expand relative paths to absolute URIs if root is available.
+      IGN.URI = expandRelativeToURI(IGN.URI, ProjectRoot, URISaver);
+      for (auto &Include : IGN.DirectIncludes)
+        Include = expandRelativeToURI(Include, ProjectRoot, URISaver);
       auto Entry = Result.Sources->try_emplace(IGN.URI).first;
       Entry->getValue() = std::move(IGN);
       // We change all the strings inside the structure to point at the keys in
@@ -508,8 +569,18 @@ llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
   if (Chunks.count("symb")) {
     Reader SymbolReader(Chunks.lookup("symb"));
     SymbolSlab::Builder Symbols;
-    while (!SymbolReader.eof())
-      Symbols.insert(readSymbol(SymbolReader, Strings->Strings, Origin));
+    while (!SymbolReader.eof()) {
+      auto Sym = readSymbol(SymbolReader, Strings->Strings, Origin);
+      // Expand relative paths in symbol locations.
+      auto ExpandLoc = [&](SymbolLocation &Loc) {
+        llvm::StringRef FileRef(Loc.FileURI);
+        auto Expanded = expandRelativeToURI(FileRef, ProjectRoot, URISaver);
+        Loc.FileURI = Expanded.data();
+      };
+      ExpandLoc(Sym.Definition);
+      ExpandLoc(Sym.CanonicalDeclaration);
+      Symbols.insert(Sym);
+    }
     if (SymbolReader.err())
       return error("malformed or truncated symbol");
     Result.Symbols = std::move(Symbols).build();
@@ -519,8 +590,13 @@ llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
     RefSlab::Builder Refs;
     while (!RefsReader.eof()) {
       auto RefsBundle = readRefs(RefsReader, Strings->Strings);
-      for (const auto &Ref : RefsBundle.second) // FIXME: bulk insert?
+      for (auto &Ref : RefsBundle.second) {
+        // Expand relative paths in ref locations.
+        llvm::StringRef FileRef(Ref.Location.FileURI);
+        auto Expanded = expandRelativeToURI(FileRef, ProjectRoot, URISaver);
+        Ref.Location.FileURI = Expanded.data();
         Refs.insert(RefsBundle.first, Ref);
+      }
     }
     if (RefsReader.err())
       return error("malformed or truncated refs");
@@ -569,10 +645,32 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
   }
   RIFF.Chunks.push_back({riff::fourCC("meta"), Meta});
 
+  // Normalize project root for relative path storage.
+  std::string NormalizedRoot;
+  if (!Data.ProjectRoot.empty()) {
+    NormalizedRoot = llvm::sys::path::convert_to_slash(Data.ProjectRoot);
+    if (NormalizedRoot.back() != '/')
+      NormalizedRoot.push_back('/');
+  }
+
+  // Write project root chunk if available.
+  if (!NormalizedRoot.empty())
+    RIFF.Chunks.push_back({riff::fourCC("root"), NormalizedRoot});
+
+  // Allocator for converted relative path strings.
+  llvm::BumpPtrAllocator RelArena;
+  llvm::StringSaver RelSaver(RelArena);
+
   StringTableOut Strings;
   std::vector<Symbol> Symbols;
   for (const auto &Sym : *Data.Symbols) {
     Symbols.emplace_back(Sym);
+    if (!NormalizedRoot.empty()) {
+      auto &S = Symbols.back();
+      convertLocationToRelative(S.CanonicalDeclaration, NormalizedRoot,
+                                RelSaver);
+      convertLocationToRelative(S.Definition, NormalizedRoot, RelSaver);
+    }
     visitStrings(Symbols.back(),
                  [&](llvm::StringRef &S) { Strings.intern(S); });
   }
@@ -580,6 +678,12 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
   if (Data.Sources)
     for (const auto &Source : *Data.Sources) {
       Sources.push_back(Source.getValue());
+      if (!NormalizedRoot.empty()) {
+        auto &IGN = Sources.back();
+        convertStringToRelative(IGN.URI, NormalizedRoot, RelSaver);
+        for (auto &Include : IGN.DirectIncludes)
+          convertStringToRelative(Include, NormalizedRoot, RelSaver);
+      }
       visitStrings(Sources.back(),
                    [&](llvm::StringRef &S) { Strings.intern(S); });
     }
@@ -589,6 +693,8 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
     for (const auto &Sym : *Data.Refs) {
       Refs.emplace_back(Sym);
       for (auto &Ref : Refs.back().second) {
+        if (!NormalizedRoot.empty())
+          convertLocationToRelative(Ref.Location, NormalizedRoot, RelSaver);
         llvm::StringRef File = Ref.Location.FileURI;
         Strings.intern(File);
         Ref.Location.FileURI = File.data();

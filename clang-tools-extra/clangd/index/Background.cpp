@@ -209,6 +209,11 @@ void BackgroundIndex::update(
   // Shard slabs into files.
   FileShardedIndex ShardedIndex(std::move(Index));
 
+  // Determine project root for relative path storage.
+  std::string ProjectSourceRoot;
+  if (auto PI = CDB.getProjectInfo(MainFile))
+    ProjectSourceRoot = PI->SourceRoot;
+
   // Build and store new slabs for each updated file.
   for (const auto &FileIt : FilesToUpdate) {
     auto Uri = FileIt.first();
@@ -221,10 +226,14 @@ void BackgroundIndex::update(
     if (Path != MainFile)
       IF->Cmd.reset();
 
+    // Build IndexFileOut with project root for relative path storage.
+    IndexFileOut IFOut(*IF);
+    IFOut.ProjectRoot = ProjectSourceRoot;
+
     // We need to store shards before updating the index, since the latter
     // consumes slabs.
     // FIXME: Also skip serializing the shard if it is already up-to-date.
-    if (auto Error = IndexStorageFactory(Path)->storeShard(Path, *IF))
+    if (auto Error = IndexStorageFactory(Path)->storeShard(Path, IFOut))
       elog("Failed to write background-index shard for file {0}: {1}", Path,
            std::move(Error));
 

@@ -62,6 +62,9 @@ struct IndexFileOut {
   // TODO: Support serializing Dex posting lists.
   IndexFileFormat Format = IndexFileFormat::RIFF;
   const tooling::CompileCommand *Cmd = nullptr;
+  // If non-empty, file URIs under this root will be stored as relative paths
+  // in the RIFF format. Must be an absolute filesystem path.
+  llvm::StringRef ProjectRoot;
 
   IndexFileOut() = default;
   IndexFileOut(const IndexFileIn &I)

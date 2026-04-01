@@ -130,6 +130,20 @@ public:
 /// in the file system.
 typedef llvm::Registry<URIScheme> URISchemeRegistry;
 
+/// Convert an absolute file:// URI to a path relative to a project root.
+/// \p ProjectRoot must be an absolute path in POSIX style (forward slashes)
+/// ending with '/'.
+/// Returns the relative POSIX path, or an error if the URI is not a file://
+/// URI or the path is not under the root.
+llvm::Expected<std::string> uriToRelativePath(llvm::StringRef FileURI,
+                                              llvm::StringRef ProjectRoot);
+
+/// Convert a relative POSIX path back to an absolute file:// URI.
+/// \p ProjectRoot must be an absolute path in POSIX style (forward slashes)
+/// ending with '/'.
+llvm::Expected<std::string> relativePathToURI(llvm::StringRef RelativePath,
+                                              llvm::StringRef ProjectRoot);
+
 } // namespace clangd
 } // namespace clang
 

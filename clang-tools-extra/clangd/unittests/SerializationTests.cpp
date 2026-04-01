@@ -8,6 +8,7 @@
 
 #include "Headers.h"
 #include "RIFF.h"
+#include "URI.h"
 #include "index/Serialization.h"
 #include "support/Logger.h"
 #include "clang/Tooling/CompilationDatabase.h"
@@ -442,6 +443,121 @@ TEST(SerializationTest, NoCrashOnBadStringTableSize) {
   ASSERT_TRUE(!CorruptParsed);
   EXPECT_THAT(llvm::toString(CorruptParsed.takeError()),
               testing::HasSubstr("bytes is implausible"));
+}
+
+TEST(SerializationTest, RelativePathRoundTrip) {
+  auto In = readIndexFile(YAML);
+  ASSERT_TRUE(bool(In)) << In.takeError();
+
+  // Write with a project root so paths become relative.
+  IndexFileOut Out(*In);
+  Out.Format = IndexFileFormat::RIFF;
+  Out.ProjectRoot = "/path";
+  std::string Serialized = llvm::to_string(Out);
+
+  // Read back - should reconstruct absolute URIs.
+  auto In2 = readIndexFile(Serialized);
+  ASSERT_TRUE(bool(In2)) << In2.takeError();
+  ASSERT_TRUE(In2->Symbols);
+  ASSERT_TRUE(In2->Refs);
+  ASSERT_TRUE(In2->Sources);
+
+  // Verify symbol URIs are restored.
+  EXPECT_THAT(yamlFromSymbols(*In2->Symbols),
+              UnorderedElementsAreArray(yamlFromSymbols(*In->Symbols)));
+  EXPECT_THAT(yamlFromRefs(*In2->Refs),
+              UnorderedElementsAreArray(yamlFromRefs(*In->Refs)));
+
+  // Verify source URIs are restored.
+  const auto *URI = "file:///path/source1.cpp";
+  ASSERT_TRUE(In2->Sources->count(URI));
+  auto IGNDeserialized = In2->Sources->lookup(URI);
+  EXPECT_EQ(llvm::toHex(IGNDeserialized.Digest), "EED8F5EAF25C453C");
+  EXPECT_THAT(IGNDeserialized.DirectIncludes,
+              ElementsAre("file:///path/inc1.h", "file:///path/inc2.h"));
+  EXPECT_EQ(IGNDeserialized.URI, URI);
+}
+
+TEST(SerializationTest, RelativePathStoredInRIFF) {
+  auto In = readIndexFile(YAML);
+  ASSERT_TRUE(bool(In)) << In.takeError();
+
+  // Write with a project root.
+  IndexFileOut Out(*In);
+  Out.Format = IndexFileFormat::RIFF;
+  Out.ProjectRoot = "/path";
+  std::string Serialized = llvm::to_string(Out);
+
+  // Low-level parse to verify the root chunk exists.
+  auto Parsed = riff::readFile(Serialized);
+  ASSERT_TRUE(bool(Parsed)) << Parsed.takeError();
+
+  // Check that a "root" chunk is present.
+  auto Root = llvm::find_if(Parsed->Chunks, [](riff::Chunk C) {
+    return C.ID == riff::fourCC("root");
+  });
+  ASSERT_NE(Root, Parsed->Chunks.end());
+  EXPECT_EQ(Root->Data, "/path/");
+}
+
+TEST(SerializationTest, NoRootChunkWithoutProjectRoot) {
+  auto In = readIndexFile(YAML);
+  ASSERT_TRUE(bool(In)) << In.takeError();
+
+  // Write without a project root - should not have root chunk.
+  IndexFileOut Out(*In);
+  Out.Format = IndexFileFormat::RIFF;
+  std::string Serialized = llvm::to_string(Out);
+
+  auto Parsed = riff::readFile(Serialized);
+  ASSERT_TRUE(bool(Parsed)) << Parsed.takeError();
+
+  auto Root = llvm::find_if(Parsed->Chunks, [](riff::Chunk C) {
+    return C.ID == riff::fourCC("root");
+  });
+  EXPECT_EQ(Root, Parsed->Chunks.end());
+}
+
+TEST(SerializationTest, RelativePathBackwardCompat) {
+  // Write without project root (simulating v20-style output, but v21 version).
+  auto In = readIndexFile(YAML);
+  ASSERT_TRUE(bool(In)) << In.takeError();
+
+  IndexFileOut Out(*In);
+  Out.Format = IndexFileFormat::RIFF;
+  // No ProjectRoot set - paths stay absolute, like old format.
+  std::string Serialized = llvm::to_string(Out);
+
+  // Should still be readable.
+  auto In2 = readIndexFile(Serialized);
+  ASSERT_TRUE(bool(In2)) << In2.takeError();
+  ASSERT_TRUE(In2->Symbols);
+  EXPECT_THAT(yamlFromSymbols(*In2->Symbols),
+              UnorderedElementsAreArray(yamlFromSymbols(*In->Symbols)));
+}
+
+TEST(URIPathConversionTest, URIToRelativePath) {
+  auto Rel = uriToRelativePath("file:///project/src/foo.h", "/project/");
+  ASSERT_TRUE(bool(Rel)) << Rel.takeError();
+  EXPECT_EQ(*Rel, "src/foo.h");
+}
+
+TEST(URIPathConversionTest, URIToRelativePathNotUnderRoot) {
+  auto Rel = uriToRelativePath("file:///other/src/foo.h", "/project/");
+  ASSERT_FALSE(bool(Rel));
+  llvm::consumeError(Rel.takeError());
+}
+
+TEST(URIPathConversionTest, RelativePathToURI) {
+  auto URI = relativePathToURI("src/foo.h", "/project/");
+  ASSERT_TRUE(bool(URI)) << URI.takeError();
+  EXPECT_EQ(*URI, "file:///project/src/foo.h");
+}
+
+TEST(URIPathConversionTest, RelativePathToURIEmpty) {
+  auto URI = relativePathToURI("", "/project/");
+  ASSERT_FALSE(bool(URI));
+  llvm::consumeError(URI.takeError());
 }
 
 } // namespace
