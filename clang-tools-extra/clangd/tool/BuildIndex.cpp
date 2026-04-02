@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ClangdLSPServer.h"
+#include "CompileCommands.h"
 #include "Config.h"
 #include "GlobalCompilationDatabase.h"
 #include "index/Background.h"
@@ -65,7 +66,16 @@ bool buildIndex(const ThreadsafeFS &TFS,
   if (!CDBOpts.CompileCommandsDir)
     CDBOpts.CompileCommandsDir = CWD.str().str();
 
-  DirectoryBasedGlobalCompilationDatabase CDB(CDBOpts);
+  DirectoryBasedGlobalCompilationDatabase BaseCDB(CDBOpts);
+
+  // Wrap in OverlayCDB with CommandMangler to apply the same compile command
+  // adjustments as normal clangd operation (resource dir, input stripping,
+  // driver resolution, etc.). Without this, flags like -msse4.2 would be
+  // mishandled by clang-cl, and builtin headers wouldn't be found.
+  auto Mangler = CommandMangler::detect();
+  if (Opts.ResourceDir)
+    Mangler.ResourceDir = *Opts.ResourceDir;
+  OverlayCDB CDB(&BaseCDB, /*FallbackFlags=*/{}, std::move(Mangler));
 
   bool IsTerminal = llvm::outs().is_displayed();
   std::atomic<unsigned> LastPrintedCompleted{0};
