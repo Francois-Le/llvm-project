@@ -337,9 +337,9 @@ llvm::Error BackgroundIndex::index(tooling::CompileCommand Cmd) {
   assert(Index.Symbols && Index.Refs && Index.Sources &&
          "Symbols, Refs and Sources must be set.");
 
-  log("Indexed {0} ({1} symbols, {2} refs, {3} files)",
-      Inputs.CompileCommand.Filename, Index.Symbols->size(),
-      Index.Refs->numRefs(), Index.Sources->size());
+  vlog("Indexed {0} ({1} symbols, {2} refs, {3} files)",
+       Inputs.CompileCommand.Filename, Index.Symbols->size(),
+       Index.Refs->numRefs(), Index.Sources->size());
   SPAN_ATTACH(Tracer, "symbols", int(Index.Symbols->size()));
   SPAN_ATTACH(Tracer, "refs", int(Index.Refs->numRefs()));
   SPAN_ATTACH(Tracer, "sources", int(Index.Sources->size()));
