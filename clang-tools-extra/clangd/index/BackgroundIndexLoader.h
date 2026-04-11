@@ -12,6 +12,7 @@
 #include "index/Background.h"
 #include "support/Path.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include <memory>
 #include <vector>
 
@@ -38,10 +39,13 @@ struct LoadedShard {
 };
 
 /// Loads all shards for the TU \p MainFile from \p Storage.
+/// If \p FS is provided, it is used to compute current file digests for
+/// content-addressed shard lookup (used with --keep-shard-history).
 std::vector<LoadedShard>
 loadIndexShards(llvm::ArrayRef<Path> MainFiles,
                 BackgroundIndexStorage::Factory &IndexStorageFactory,
-                const GlobalCompilationDatabase &CDB);
+                const GlobalCompilationDatabase &CDB,
+                llvm::vfs::FileSystem *FS = nullptr);
 
 } // namespace clangd
 } // namespace clang

@@ -112,8 +112,15 @@ bool buildIndex(const ThreadsafeFS &TFS,
 
   BackgroundIndex Idx(
       TFS, CDB,
-      BackgroundIndexStorage::createDiskBackedStorageFactory(
-          [&CDB](llvm::StringRef File) { return CDB.getProjectInfo(File); }),
+      Opts.KeepShardHistory
+          ? BackgroundIndexStorage::createDiskBackedHistoryStorageFactory(
+                [&CDB](llvm::StringRef File) {
+                  return CDB.getProjectInfo(File);
+                })
+          : BackgroundIndexStorage::createDiskBackedStorageFactory(
+                [&CDB](llvm::StringRef File) {
+                  return CDB.getProjectInfo(File);
+                }),
       std::move(BGOpts));
 
   // Trigger CDB discovery by querying a compile command for a synthetic path

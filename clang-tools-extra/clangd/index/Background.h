@@ -47,10 +47,28 @@ public:
   virtual llvm::Error storeShard(llvm::StringRef ShardIdentifier,
                                  IndexFileOut Shard) const = 0;
 
+  // Store a shard with an associated content digest. Implementations that
+  // support content-addressed storage use the digest to produce a unique
+  // filename per file version. The default delegates to the path-only overload.
+  virtual llvm::Error storeShard(llvm::StringRef ShardIdentifier,
+                                 IndexFileOut Shard,
+                                 const FileDigest &ContentDigest) const {
+    return storeShard(ShardIdentifier, std::move(Shard));
+  }
+
   // Tries to load shard with given identifier, returns nullptr if shard
   // couldn't be loaded.
   virtual std::unique_ptr<IndexFileIn>
   loadShard(llvm::StringRef ShardIdentifier) const = 0;
+
+  // Load a shard matching a specific content digest. Implementations that
+  // support content-addressed storage use the digest to locate the exact
+  // version. The default delegates to the path-only overload.
+  virtual std::unique_ptr<IndexFileIn>
+  loadShard(llvm::StringRef ShardIdentifier,
+            const FileDigest &ContentDigest) const {
+    return loadShard(ShardIdentifier);
+  }
 
   // The factory provides storage for each File.
   // It keeps ownership of the storage instances, and should manage caching
@@ -62,6 +80,13 @@ public:
   // CDBDirectory is the first directory containing a CDB in parent directories
   // of a file, or user cache directory if none was found, e.g. stdlib headers.
   static Factory createDiskBackedStorageFactory(
+      std::function<std::optional<ProjectInfo>(PathRef)> GetProjectInfo);
+
+  // Creates an Index Storage that keeps shards for all file versions.
+  // Shard filenames include a content hash, so different versions of the same
+  // file produce distinct shards. When a shard already exists, its modification
+  // time is updated to support age-based cleanup.
+  static Factory createDiskBackedHistoryStorageFactory(
       std::function<std::optional<ProjectInfo>(PathRef)> GetProjectInfo);
 };
 

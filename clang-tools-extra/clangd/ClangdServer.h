@@ -128,6 +128,8 @@ public:
     /// on background threads. The index is stored in the project root.
     bool BackgroundIndex = false;
     llvm::ThreadPriority BackgroundIndexPriority = llvm::ThreadPriority::Low;
+    /// If true, keep index shards for all file versions (content-addressed).
+    bool KeepShardHistory = false;
 
     /// If set, use this index to augment code completion results.
     SymbolIndex *StaticIndex = nullptr;

@@ -233,7 +233,9 @@ void BackgroundIndex::update(
     // We need to store shards before updating the index, since the latter
     // consumes slabs.
     // FIXME: Also skip serializing the shard if it is already up-to-date.
-    if (auto Error = IndexStorageFactory(Path)->storeShard(Path, IFOut))
+    const FileDigest &ContentHash = FileIt.getValue().second;
+    if (auto Error =
+            IndexStorageFactory(Path)->storeShard(Path, IFOut, ContentHash))
       elog("Failed to write background-index shard for file {0}: {1}", Path,
            std::move(Error));
 
@@ -371,9 +373,12 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
              Config::BackgroundPolicy::Skip;
     });
   Rebuilder.startLoading();
+  // Create a filesystem view for content-addressed shard lookup and staleness
+  // checking.
+  auto FS = TFS.view(/*CWD=*/std::nullopt);
   // Load shards for all of the mainfiles.
   const std::vector<LoadedShard> Result =
-      loadIndexShards(MainFiles, IndexStorageFactory, CDB);
+      loadIndexShards(MainFiles, IndexStorageFactory, CDB, FS.get());
   size_t LoadedShards = 0;
   {
     // Update in-memory state.
@@ -405,7 +410,6 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
   Rebuilder.loadedShard(LoadedShards);
   Rebuilder.doneLoading();
 
-  auto FS = TFS.view(/*CWD=*/std::nullopt);
   llvm::DenseSet<PathRef> TUsToIndex;
   // We'll accept data from stale shards, but ensure the files get reindexed
   // soon.

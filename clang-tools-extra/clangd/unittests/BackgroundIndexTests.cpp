@@ -2,19 +2,25 @@
 #include "CompileCommands.h"
 #include "Config.h"
 #include "Headers.h"
+#include "SourceCode.h"
 #include "SyncAPI.h"
 #include "TestFS.h"
 #include "TestTU.h"
 #include "index/Background.h"
 #include "index/BackgroundRebuild.h"
 #include "index/MemIndex.h"
+#include "index/Serialization.h"
 #include "clang/Tooling/ArgumentsAdjusters.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ScopedPrinter.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include <chrono>
 #include <deque>
+#include <thread>
 
 using ::testing::_;
 using ::testing::AllOf;
@@ -1029,6 +1035,153 @@ TEST(BackgroundIndex, Profile) {
   Idx.profile(MT);
   ASSERT_THAT(MT.children(),
               UnorderedElementsAre(Pair("slabs", _), Pair("index", _)));
+}
+
+// Helper to create a minimal valid IndexFileOut for storage tests.
+static IndexFileIn makeMinimalShard() {
+  IndexFileIn IF;
+  IF.Symbols.emplace();
+  IF.Refs.emplace();
+  IF.Relations.emplace();
+  IF.Sources.emplace();
+  return IF;
+}
+
+TEST(HistoryDiskBackedIndexStorageTest, TwoVersionsProduceTwoFiles) {
+  // Create a temporary directory for the shard store.
+  llvm::SmallString<128> Dir;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory("history-test", Dir));
+  auto Cleanup = llvm::make_scope_exit(
+      [&] { llvm::sys::fs::remove_directories(Dir); });
+
+  auto Factory =
+      BackgroundIndexStorage::createDiskBackedHistoryStorageFactory(
+          [&](llvm::StringRef) -> std::optional<ProjectInfo> {
+            return ProjectInfo{std::string(Dir)};
+          });
+
+  llvm::SmallString<128> CacheDir(Dir);
+  llvm::sys::path::append(CacheDir, ".cache", "clangd", "index");
+
+  BackgroundIndexStorage *Storage = Factory("/fake/src/foo.cpp");
+
+  // Store with digest A.
+  FileDigest DigestA = {{1, 2, 3, 4, 5, 6, 7, 8}};
+  {
+    auto Shard = makeMinimalShard();
+    IndexFileOut Out(Shard);
+    auto Err = Storage->storeShard("/fake/src/foo.cpp", std::move(Out), DigestA);
+    ASSERT_FALSE(bool(Err)) << Err;
+  }
+
+  // Store with digest B.
+  FileDigest DigestB = {{9, 10, 11, 12, 13, 14, 15, 16}};
+  {
+    auto Shard = makeMinimalShard();
+    IndexFileOut Out(Shard);
+    auto Err = Storage->storeShard("/fake/src/foo.cpp", std::move(Out), DigestB);
+    ASSERT_FALSE(bool(Err)) << Err;
+  }
+
+  // Both shards should be on disk — count .idx files.
+  std::error_code EC;
+  unsigned IdxCount = 0;
+  for (llvm::sys::fs::directory_iterator It(CacheDir, EC), End;
+       It != End && !EC; It.increment(EC)) {
+    if (llvm::StringRef(It->path()).ends_with(".idx"))
+      ++IdxCount;
+  }
+  EXPECT_EQ(IdxCount, 2u);
+
+  // Loading by digest should return the correct shard.
+  auto LoadedA = Storage->loadShard("/fake/src/foo.cpp", DigestA);
+  EXPECT_NE(LoadedA, nullptr);
+  auto LoadedB = Storage->loadShard("/fake/src/foo.cpp", DigestB);
+  EXPECT_NE(LoadedB, nullptr);
+
+  // Loading without digest returns nullptr for history storage.
+  auto LoadedNone = Storage->loadShard("/fake/src/foo.cpp");
+  EXPECT_EQ(LoadedNone, nullptr);
+}
+
+TEST(HistoryDiskBackedIndexStorageTest, StoreSameDigestTouchesMtime) {
+  llvm::SmallString<128> Dir;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory("history-mtime", Dir));
+  auto Cleanup = llvm::make_scope_exit(
+      [&] { llvm::sys::fs::remove_directories(Dir); });
+
+  auto Factory =
+      BackgroundIndexStorage::createDiskBackedHistoryStorageFactory(
+          [&](llvm::StringRef) -> std::optional<ProjectInfo> {
+            return ProjectInfo{std::string(Dir)};
+          });
+
+  BackgroundIndexStorage *Storage = Factory("/fake/src/bar.cpp");
+
+  FileDigest Digest = {{1, 2, 3, 4, 5, 6, 7, 8}};
+
+  // Store the shard for the first time.
+  {
+    auto Shard = makeMinimalShard();
+    IndexFileOut Out(Shard);
+    auto Err = Storage->storeShard("/fake/src/bar.cpp", std::move(Out), Digest);
+    ASSERT_FALSE(bool(Err)) << Err;
+  }
+
+  // Record the modification time.
+  llvm::SmallString<128> CacheDir(Dir);
+  llvm::sys::path::append(CacheDir, ".cache", "clangd", "index");
+  std::string ShardPath;
+  {
+    std::error_code EC;
+    for (llvm::sys::fs::directory_iterator It(CacheDir, EC), End;
+         It != End && !EC; It.increment(EC)) {
+      if (llvm::StringRef(It->path()).ends_with(".idx")) {
+        ShardPath = It->path();
+        break;
+      }
+    }
+  }
+  ASSERT_FALSE(ShardPath.empty());
+  llvm::sys::fs::file_status StatBefore;
+  ASSERT_FALSE(llvm::sys::fs::status(ShardPath, StatBefore));
+
+  // Wait briefly so the filesystem mtime granularity is exceeded.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Store again with the same digest — should touch mtime, not rewrite.
+  {
+    auto Shard = makeMinimalShard();
+    IndexFileOut Out(Shard);
+    auto Err = Storage->storeShard("/fake/src/bar.cpp", std::move(Out), Digest);
+    ASSERT_FALSE(bool(Err)) << Err;
+  }
+
+  llvm::sys::fs::file_status StatAfter;
+  ASSERT_FALSE(llvm::sys::fs::status(ShardPath, StatAfter));
+  EXPECT_GE(StatAfter.getLastModificationTime(),
+            StatBefore.getLastModificationTime());
+}
+
+TEST(HistoryDiskBackedIndexStorageTest, PathOnlyStoreReturnsError) {
+  llvm::SmallString<128> Dir;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory("history-err", Dir));
+  auto Cleanup = llvm::make_scope_exit(
+      [&] { llvm::sys::fs::remove_directories(Dir); });
+
+  auto Factory =
+      BackgroundIndexStorage::createDiskBackedHistoryStorageFactory(
+          [&](llvm::StringRef) -> std::optional<ProjectInfo> {
+            return ProjectInfo{std::string(Dir)};
+          });
+
+  BackgroundIndexStorage *Storage = Factory("/fake/src/baz.cpp");
+
+  auto Shard = makeMinimalShard();
+  IndexFileOut Out(Shard);
+  auto Err = Storage->storeShard("/fake/src/baz.cpp", std::move(Out));
+  EXPECT_TRUE(bool(Err));
+  llvm::consumeError(std::move(Err));
 }
 
 } // namespace clangd

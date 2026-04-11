@@ -186,6 +186,16 @@ opt<bool> BuildIndex{
     init(false),
 };
 
+opt<bool> KeepShardHistory{
+    "keep-shard-history",
+    cat(Features),
+    desc("Keep index shards for all versions of a file instead of overwriting. "
+         "Shard filenames include a content hash to prevent collisions. "
+         "When combined with --build-index, unchanged shards have their "
+         "timestamps updated for age-based cleanup."),
+    init(false),
+};
+
 opt<llvm::ThreadPriority> BackgroundIndexPriority{
     "background-index-priority",
     cat(Features),
@@ -951,6 +961,7 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
 #endif
   Opts.BackgroundIndex = EnableBackgroundIndex;
   Opts.BackgroundIndexPriority = BackgroundIndexPriority;
+  Opts.KeepShardHistory = KeepShardHistory;
   Opts.ReferencesLimit = ReferencesLimit;
   Opts.Rename.LimitFiles = RenameFileLimit;
   auto PAI = createProjectAwareIndex(

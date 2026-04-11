@@ -8,11 +8,13 @@
 
 #include "index/BackgroundIndexLoader.h"
 #include "GlobalCompilationDatabase.h"
+#include "SourceCode.h"
 #include "index/Background.h"
 #include "support/Logger.h"
 #include "support/Path.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include <string>
 #include <utility>
 #include <vector>
@@ -25,8 +27,9 @@ namespace {
 /// inverse dependency mapping.
 class BackgroundIndexLoader {
 public:
-  BackgroundIndexLoader(BackgroundIndexStorage::Factory &IndexStorageFactory)
-      : IndexStorageFactory(IndexStorageFactory) {}
+  BackgroundIndexLoader(BackgroundIndexStorage::Factory &IndexStorageFactory,
+                        llvm::vfs::FileSystem *FS)
+      : IndexStorageFactory(IndexStorageFactory), FS(FS) {}
   /// Load the shards for \p MainFile and all of its dependencies.
   void load(PathRef MainFile);
 
@@ -44,6 +47,7 @@ private:
   llvm::StringMap<LoadedShard> LoadedShards;
 
   BackgroundIndexStorage::Factory &IndexStorageFactory;
+  llvm::vfs::FileSystem *FS;
 };
 
 std::pair<const LoadedShard &, std::vector<Path>>
@@ -58,7 +62,19 @@ BackgroundIndexLoader::loadShard(PathRef StartSourceFile, PathRef DependentTU) {
   LS.AbsolutePath = StartSourceFile.str();
   LS.DependentTU = std::string(DependentTU);
   BackgroundIndexStorage *Storage = IndexStorageFactory(LS.AbsolutePath);
-  auto Shard = Storage->loadShard(StartSourceFile);
+
+  // Try content-addressed lookup first if we have a filesystem.
+  std::unique_ptr<IndexFileIn> Shard;
+  if (FS) {
+    if (auto Buf = FS->getBufferForFile(StartSourceFile)) {
+      FileDigest CurrentDigest = digest(Buf->get()->getBuffer());
+      Shard = Storage->loadShard(StartSourceFile, CurrentDigest);
+    }
+  }
+  // Fall back to path-only lookup (used by DiskBackedIndexStorage).
+  if (!Shard)
+    Shard = Storage->loadShard(StartSourceFile);
+
   if (!Shard || !Shard->Sources) {
     vlog("Failed to load shard: {0}", StartSourceFile);
     return {LS, Edges};
@@ -119,8 +135,9 @@ std::vector<LoadedShard> BackgroundIndexLoader::takeResult() && {
 std::vector<LoadedShard>
 loadIndexShards(llvm::ArrayRef<Path> MainFiles,
                 BackgroundIndexStorage::Factory &IndexStorageFactory,
-                const GlobalCompilationDatabase &CDB) {
-  BackgroundIndexLoader Loader(IndexStorageFactory);
+                const GlobalCompilationDatabase &CDB,
+                llvm::vfs::FileSystem *FS) {
+  BackgroundIndexLoader Loader(IndexStorageFactory, FS);
   for (llvm::StringRef MainFile : MainFiles) {
     assert(llvm::sys::path::is_absolute(MainFile));
     Loader.load(MainFile);
