@@ -12,6 +12,7 @@
 
 #include "CompileCommands.h"
 #include "Compiler.h"
+#include "Headers.h"
 #include "index/IndexAction.h"
 #include "index/Merge.h"
 #include "index/Ref.h"
@@ -90,7 +91,15 @@ public:
           Relations.insert(R);
         }
       }
-      // FIXME: Handle Result.Sources?
+      if (Result.Sources) {
+        std::lock_guard<std::mutex> Lock(SourcesMu);
+        for (const auto &Entry : *Result.Sources) {
+          auto &Node = Sources[Entry.getKey()];
+          Node = Entry.getValue();
+          // URI is a reference into the StringMap key.
+          Node.URI = Sources.find(Entry.getKey())->getKey();
+        }
+      }
     });
   }
 
@@ -109,6 +118,7 @@ public:
     Result.Symbols = std::move(Symbols).build();
     Result.Refs = std::move(Refs).build();
     Result.Relations = std::move(Relations).build();
+    Result.Sources = std::move(Sources);
   }
 
 private:
@@ -121,6 +131,8 @@ private:
   RefSlab::Builder Refs;
   std::mutex RelsMu;
   RelationSlab::Builder Relations;
+  std::mutex SourcesMu;
+  IncludeGraph Sources;
 };
 
 } // namespace
