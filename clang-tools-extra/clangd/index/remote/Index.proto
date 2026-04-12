@@ -150,3 +150,22 @@ message ContainedRef {
   optional uint32 kind = 2;
   optional string symbol = 3;
 }
+
+// Request file content digests from the remote index. If file_paths is empty,
+// digests for all indexed files are returned.
+message FileDigestsRequest {
+  repeated string file_paths = 1;
+}
+
+// A single file's content digest as known by the remote index.
+message FileDigestEntry {
+  // Relative file path (translated by the marshalling layer).
+  optional string file_path = 1;
+  // 8-byte content digest (xxh3_64bits of file content).
+  optional bytes digest = 2;
+}
+
+// Response containing file content digests.
+message FileDigestsReply {
+  repeated FileDigestEntry entries = 1;
+}

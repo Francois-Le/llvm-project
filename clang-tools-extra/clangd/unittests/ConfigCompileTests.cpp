@@ -185,7 +185,7 @@ TEST_F(ConfigCompileTests, Index) {
   EXPECT_THAT(
       Diags.Diagnostics,
       ElementsAre(diagMessage(
-          "Invalid Background value 'Foo'. Valid values are Build, Skip.")));
+          "Invalid Background value 'Foo'. Valid values are Build, Skip, Lazy.")));
 }
 
 TEST_F(ConfigCompileTests, PathSpecMatch) {
@@ -414,10 +414,10 @@ TEST_F(ConfigCompileTests, ExternalBlockDisablesBackgroundIndex) {
       testPath("foo/bar", llvm::sys::path::Style::posix));
   Frag.Index.External = std::move(External);
   compileAndApply();
-  EXPECT_EQ(Conf.Index.Background, Config::BackgroundPolicy::Skip);
+  EXPECT_EQ(Conf.Index.Background, Config::BackgroundPolicy::Lazy);
 }
 
-TEST_F(ConfigCompileTests, ExternalBlockMountPoint) {
+TEST_F(ConfigCompileTests, ExternalBlockMountPoint){
   auto GetFrag = [](llvm::StringRef Directory,
                     std::optional<const char *> MountPoint) {
     Fragment Frag;

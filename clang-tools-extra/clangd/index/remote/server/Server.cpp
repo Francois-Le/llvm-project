@@ -7,11 +7,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "Feature.h"
+#include "Headers.h"
 #include "Index.pb.h"
 #include "MonitoringService.grpc.pb.h"
 #include "MonitoringService.pb.h"
 #include "Service.grpc.pb.h"
 #include "Service.pb.h"
+#include "SourceCode.h"
 #include "index/Index.h"
 #include "index/Serialization.h"
 #include "index/Symbol.h"
@@ -36,6 +38,7 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -122,6 +125,25 @@ public:
     ProtobufMarshaller = std::unique_ptr<Marshaller>(new Marshaller(
         /*RemoteIndexRoot=*/llvm::StringRef(NativePath),
         /*LocalIndexRoot=*/""));
+  }
+
+  /// Update the stored file digests from an IncludeGraph. Thread-safe.
+  void updateSources(const IncludeGraph &Sources) {
+    std::lock_guard<std::mutex> Lock(SourcesMu);
+    FileDigestMap.clear();
+    for (const auto &Entry : Sources) {
+      const IncludeGraphNode &Node = Entry.getValue();
+      if (Node.Digest == FileDigest{{0}})
+        continue;
+      // Convert URI to relative path for wire transmission.
+      auto RelPath = ProtobufMarshaller->uriToRelativePath(Node.URI);
+      if (!RelPath) {
+        log("FileDigests: skipping {0}: {1}", Node.URI, RelPath.takeError());
+        continue;
+      }
+      FileDigestMap[*RelPath] = Node.Digest;
+    }
+    vlog("Updated file digest map with {0} entries", FileDigestMap.size());
   }
 
 private:
@@ -399,6 +421,43 @@ private:
     return grpc::Status::OK;
   }
 
+  grpc::Status FileDigests(grpc::ServerContext *Context,
+                           const FileDigestsRequest *Request,
+                           FileDigestsReply *Reply) override {
+    auto StartTime = stopwatch::now();
+    WithContextValue WithRequestContext(CurrentRequest, Context);
+    logRequest(*Request);
+    trace::Span Tracer("FileDigestsRequest");
+    unsigned Sent = 0;
+    {
+      std::lock_guard<std::mutex> Lock(SourcesMu);
+      if (Request->file_paths_size() == 0) {
+        // Return all file digests.
+        for (const auto &Entry : FileDigestMap) {
+          auto *E = Reply->add_entries();
+          E->set_file_path(Entry.first());
+          E->set_digest(Entry.second.data(), Entry.second.size());
+          ++Sent;
+        }
+      } else {
+        // Return only requested files.
+        for (const auto &Path : Request->file_paths()) {
+          auto It = FileDigestMap.find(Path);
+          if (It != FileDigestMap.end()) {
+            auto *E = Reply->add_entries();
+            E->set_file_path(It->first());
+            E->set_digest(It->second.data(), It->second.size());
+            ++Sent;
+          }
+        }
+      }
+    }
+    logResponse(*Reply);
+    SPAN_ATTACH(Tracer, "Sent", Sent);
+    logRequestSummary("v1/FileDigests", Sent, StartTime);
+    return grpc::Status::OK;
+  }
+
   // Proxy object to allow proto messages to be lazily serialized as text.
   struct TextProto {
     const google::protobuf::Message &M;
@@ -425,6 +484,8 @@ private:
 
   std::unique_ptr<Marshaller> ProtobufMarshaller;
   clangd::SymbolIndex &Index;
+  std::mutex SourcesMu;
+  llvm::StringMap<FileDigest> FileDigestMap;
 };
 
 class Monitor final : public v1::Monitor::Service {
@@ -472,7 +533,7 @@ void maybeTrimMemory() {
 void hotReload(clangd::SwapIndex &Index, llvm::StringRef IndexPath,
                llvm::vfs::Status &LastStatus,
                llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> &FS,
-               Monitor &Monitor) {
+               Monitor &Monitor, RemoteIndexServer &Service) {
   // glibc malloc doesn't shrink an arena if there are items living at the end,
   // which might happen since we destroy the old index after building new one.
   // Trim more aggresively to keep memory usage of the server low.
@@ -490,22 +551,24 @@ void hotReload(clangd::SwapIndex &Index, llvm::StringRef IndexPath,
        "{0}, new index was modified at {1}. Attempting to reload.",
        LastStatus.getLastModificationTime(), Status->getLastModificationTime());
   LastStatus = *Status;
+  std::optional<IncludeGraph> Sources;
   std::unique_ptr<clang::clangd::SymbolIndex> NewIndex =
       loadIndex(IndexPath, SymbolOrigin::Static, /*UseDex=*/true,
-                /*SupportContainedRefs=*/true);
+                /*SupportContainedRefs=*/true, Sources);
   if (!NewIndex) {
     elog("Failed to load new index. Old index will be served.");
     return;
   }
   Index.reset(std::move(NewIndex));
+  if (Sources)
+    Service.updateSources(*Sources);
   Monitor.updateIndex(Status->getLastModificationTime());
   log("New index version loaded. Last modification time: {0}, size: {1} bytes.",
       Status->getLastModificationTime(), Status->getSize());
 }
 
-void runServerAndWait(clangd::SymbolIndex &Index, llvm::StringRef ServerAddress,
+void runServerAndWait(RemoteIndexServer &Service, llvm::StringRef ServerAddress,
                       llvm::StringRef IndexPath, Monitor &Monitor) {
-  RemoteIndexServer Service(Index, IndexRoot);
 
   grpc::EnableDefaultHealthCheckService(true);
 #if ENABLE_GRPC_REFLECTION
@@ -628,27 +691,33 @@ int main(int argc, char *argv[]) {
     return Status.getError().value();
   }
 
+  std::optional<clang::clangd::IncludeGraph> Sources;
   auto SymIndex = clang::clangd::loadIndex(
       IndexPath, clang::clangd::SymbolOrigin::Static, /*UseDex=*/true,
-      /*SupportContainedRefs=*/true);
+      /*SupportContainedRefs=*/true, Sources);
   if (!SymIndex) {
     llvm::errs() << "Failed to open the index.\n";
     return -1;
   }
   clang::clangd::SwapIndex Index(std::move(SymIndex));
 
+  RemoteIndexServer Service(Index, IndexRoot);
+  if (Sources)
+    Service.updateSources(*Sources);
+
   Monitor Monitor(Status->getLastModificationTime());
 
-  std::thread HotReloadThread([&Index, &Status, &FS, &Monitor]() {
+  std::thread HotReloadThread([&Index, &Status, &FS, &Monitor, &Service]() {
     llvm::vfs::Status LastStatus = *Status;
     static constexpr auto RefreshFrequency = std::chrono::seconds(30);
     while (!clang::clangd::shutdownRequested()) {
-      hotReload(Index, llvm::StringRef(IndexPath), LastStatus, FS, Monitor);
+      hotReload(Index, llvm::StringRef(IndexPath), LastStatus, FS, Monitor,
+                Service);
       std::this_thread::sleep_for(RefreshFrequency);
     }
   });
 
-  runServerAndWait(Index, ServerAddress, IndexPath, Monitor);
+  runServerAndWait(Service, ServerAddress, IndexPath, Monitor);
 
   HotReloadThread.join();
 }

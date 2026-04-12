@@ -259,6 +259,7 @@ ClangdServer::ClangdServer(const GlobalCompilationDatabase &CDB,
     };
     BGOpts.ContextProvider = Opts.ContextProvider;
     BGOpts.SupportContainedRefs = Opts.EnableOutgoingCalls;
+    BGOpts.ExternalDigestProvider = Opts.ExternalDigestProvider;
     BackgroundIdx = std::make_unique<BackgroundIndex>(
         TFS, CDB,
         Opts.KeepShardHistory

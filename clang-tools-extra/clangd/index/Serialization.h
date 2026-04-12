@@ -89,6 +89,13 @@ std::unique_ptr<SymbolIndex> loadIndex(llvm::StringRef Filename,
                                        SymbolOrigin Origin, bool UseDex,
                                        bool SupportContainedRefs);
 
+// Like loadIndex, but also returns the IncludeGraph (Sources) from the index
+// file if present. This allows callers to access per-file content digests.
+std::unique_ptr<SymbolIndex>
+loadIndex(llvm::StringRef Filename, SymbolOrigin Origin, bool UseDex,
+          bool SupportContainedRefs,
+          std::optional<IncludeGraph> &OutSources);
+
 } // namespace clangd
 } // namespace clang
 

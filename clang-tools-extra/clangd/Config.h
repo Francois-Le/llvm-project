@@ -73,7 +73,7 @@ struct Config {
     BuiltinHeaderPolicy BuiltinHeaders = BuiltinHeaderPolicy::Clangd;
   } CompileFlags;
 
-  enum class BackgroundPolicy { Build, Skip };
+  enum class BackgroundPolicy { Build, Skip, Lazy };
   /// Describes an external index configuration.
   struct ExternalIndexSpec {
     enum { None, File, Server } Kind = None;

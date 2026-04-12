@@ -26,4 +26,8 @@ service SymbolIndex {
   rpc Relations(RelationsRequest) returns (stream RelationsReply) {}
 
   rpc ReverseRelations(RelationsRequest) returns (stream RelationsReply) {}
+
+  // Returns content digests for indexed files, allowing clients to determine
+  // which files have changed locally relative to the remote index.
+  rpc FileDigests(FileDigestsRequest) returns (FileDigestsReply) {}
 }

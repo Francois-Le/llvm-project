@@ -812,6 +812,15 @@ llvm::Expected<IndexFileIn> readIndexFile(llvm::StringRef Data,
 std::unique_ptr<SymbolIndex> loadIndex(llvm::StringRef SymbolFilename,
                                        SymbolOrigin Origin, bool UseDex,
                                        bool SupportContainedRefs) {
+  std::optional<IncludeGraph> DiscardedSources;
+  return loadIndex(SymbolFilename, Origin, UseDex, SupportContainedRefs,
+                   DiscardedSources);
+}
+
+std::unique_ptr<SymbolIndex>
+loadIndex(llvm::StringRef SymbolFilename, SymbolOrigin Origin, bool UseDex,
+          bool SupportContainedRefs,
+          std::optional<IncludeGraph> &OutSources) {
   trace::Span OverallTracer("LoadIndex");
   auto Buffer = llvm::MemoryBuffer::getFile(SymbolFilename);
   if (!Buffer) {
@@ -831,6 +840,8 @@ std::unique_ptr<SymbolIndex> loadIndex(llvm::StringRef SymbolFilename,
         Refs = std::move(*I->Refs);
       if (I->Relations)
         Relations = std::move(*I->Relations);
+      if (I->Sources)
+        OutSources = std::move(*I->Sources);
     } else {
       elog("Bad index file: {0}", I.takeError());
       return nullptr;

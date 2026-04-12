@@ -10,17 +10,22 @@
 
 #include "Client.h"
 #include "Feature.h"
+#include "Index.pb.h"
 #include "Service.grpc.pb.h"
+#include "SourceCode.h"
+#include "URI.h"
 #include "index/Index.h"
 #include "marshalling/Marshalling.h"
 #include "support/Logger.h"
 #include "support/Trace.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <memory>
 
 namespace clang {
@@ -181,6 +186,9 @@ public:
     //        the file was indexed or not. A possible implementation could be
     //        based on the idea that we do not want to send a request at every
     //        call of a function returned by IndexClient::indexedFiles().
+    // TODO: Use the file digests fetched via fetchFileDigests() to populate
+    //       this. Requires either a SymbolIndex interface extension or
+    //       passing the URI set through getClient().
     return [](llvm::StringRef) { return IndexContents::None; };
   }
 
@@ -206,6 +214,55 @@ std::unique_ptr<clangd::SymbolIndex> getClient(llvm::StringRef Address,
       grpc::CreateChannel(Address.str(), grpc::InsecureChannelCredentials());
   return std::unique_ptr<clangd::SymbolIndex>(
       new IndexClient(Channel, Address, ProjectRoot));
+}
+
+llvm::StringMap<FileDigest> fetchFileDigests(llvm::StringRef Address,
+                                             llvm::StringRef IndexRoot) {
+  llvm::StringMap<FileDigest> Result;
+  const auto Channel =
+      grpc::CreateChannel(Address.str(), grpc::InsecureChannelCredentials());
+  auto Stub = remote::v1::SymbolIndex::NewStub(Channel);
+  Marshaller M(/*RemoteIndexRoot=*/"", /*LocalIndexRoot=*/IndexRoot);
+
+  grpc::ClientContext Context;
+  Context.set_deadline(std::chrono::system_clock::now() +
+                       std::chrono::seconds(30));
+  FileDigestsRequest Request;
+  FileDigestsReply Reply;
+  auto Status = Stub->FileDigests(&Context, Request, &Reply);
+  if (!Status.ok()) {
+    elog("FileDigests RPC failed: {0}", Status.error_message());
+    return Result;
+  }
+  for (const auto &Entry : Reply.entries()) {
+    auto LocalPath = M.relativePathToURI(Entry.file_path());
+    if (!LocalPath) {
+      log("FileDigests: skipping entry: {0}", LocalPath.takeError());
+      continue;
+    }
+    // Extract the local filesystem path from the URI.
+    auto ParsedURI = URI::parse(*LocalPath);
+    if (!ParsedURI) {
+      log("FileDigests: bad URI: {0}", ParsedURI.takeError());
+      continue;
+    }
+    auto AbsPath = URI::resolve(*ParsedURI);
+    if (!AbsPath) {
+      log("FileDigests: can't resolve: {0}", AbsPath.takeError());
+      continue;
+    }
+    if (Entry.digest().size() == sizeof(FileDigest)) {
+      FileDigest D;
+      std::memcpy(D.data(), Entry.digest().data(), sizeof(FileDigest));
+      Result[*AbsPath] = D;
+    } else {
+      log("FileDigests: unexpected digest size for {0}: expected {1}, got {2}",
+          Entry.file_path(), sizeof(FileDigest), Entry.digest().size());
+    }
+  }
+  vlog("Fetched {0} file digests from remote index at {1}", Result.size(),
+       Address);
+  return Result;
 }
 
 } // namespace remote

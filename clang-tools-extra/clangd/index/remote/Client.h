@@ -9,7 +9,9 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANGD_INDEX_REMOTE_CLIENT_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANGD_INDEX_REMOTE_CLIENT_H
 
+#include "SourceCode.h"
 #include "index/Index.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <memory>
@@ -31,6 +33,13 @@ namespace remote {
 /// if the project was compiled without Remote Index support.
 std::unique_ptr<clangd::SymbolIndex> getClient(llvm::StringRef Address,
                                                llvm::StringRef IndexRoot);
+
+/// Fetches per-file content digests from the remote index server.
+/// The returned map keys are absolute local file paths (translated from
+/// server-relative paths using \p IndexRoot). Values are 8-byte content
+/// digests (xxh3_64bits). Returns an empty map on failure.
+llvm::StringMap<FileDigest> fetchFileDigests(llvm::StringRef Address,
+                                             llvm::StringRef IndexRoot);
 
 } // namespace remote
 } // namespace clangd

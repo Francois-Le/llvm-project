@@ -958,10 +958,38 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
            "Only one can be used at time. Remote index will ignored.");
     }
   }
+  // When a remote index is configured and background indexing is enabled,
+  // fetch file digests from the remote server so the background indexer can
+  // skip files that the remote already covers at the same content version.
+  std::shared_ptr<llvm::StringMap<FileDigest>> RemoteDigests;
+  if (!RemoteIndexAddress.empty() && EnableBackgroundIndex) {
+    auto Digests = remote::fetchFileDigests(RemoteIndexAddress, ProjectRoot);
+    if (!Digests.empty()) {
+      RemoteDigests =
+          std::make_shared<llvm::StringMap<FileDigest>>(std::move(Digests));
+      log("Fetched {0} file digests from remote index for lazy background "
+          "indexing",
+          RemoteDigests->size());
+    }
+  }
 #endif
   Opts.BackgroundIndex = EnableBackgroundIndex;
   Opts.BackgroundIndexPriority = BackgroundIndexPriority;
   Opts.KeepShardHistory = KeepShardHistory;
+#if CLANGD_ENABLE_REMOTE
+  if (RemoteDigests) {
+    Opts.ExternalDigestProvider =
+        [Digests = RemoteDigests](PathRef Path) -> std::optional<FileDigest> {
+      auto It = Digests->find(Path);
+      if (It != Digests->end())
+        return It->second;
+      return std::nullopt;
+    };
+    // When using lazy mode with remote index, local shards should NOT use
+    // history storage regardless of the --keep-shard-history flag.
+    Opts.KeepShardHistory = false;
+  }
+#endif
   Opts.ReferencesLimit = ReferencesLimit;
   Opts.Rename.LimitFiles = RenameFileLimit;
   auto PAI = createProjectAwareIndex(

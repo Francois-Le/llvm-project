@@ -340,6 +340,7 @@ struct FragmentCompiler {
               compileEnum<Config::BackgroundPolicy>("Background", *F.Background)
                   .map("Build", Config::BackgroundPolicy::Build)
                   .map("Skip", Config::BackgroundPolicy::Skip)
+                  .map("Lazy", Config::BackgroundPolicy::Lazy)
                   .value())
         Out.Apply.push_back(
             [Val](const Params &, Config &C) { C.Index.Background = *Val; });
@@ -416,10 +417,11 @@ struct FragmentCompiler {
                                             llvm::sys::path::Style::posix))
         return;
       C.Index.External = Spec;
-      // Disable background indexing for the files under the mountpoint.
+      // When a remote index covers this path, use lazy background indexing:
+      // only locally-modified files will be indexed in the background.
       // Note that this will overwrite statements in any previous fragments
       // (including the current one).
-      C.Index.Background = Config::BackgroundPolicy::Skip;
+      C.Index.Background = Config::BackgroundPolicy::Lazy;
     });
   }
 

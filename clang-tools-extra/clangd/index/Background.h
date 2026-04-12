@@ -173,6 +173,11 @@ public:
     // Whether the index needs to support the containedRefs() operation.
     // May use extra memory.
     bool SupportContainedRefs = true;
+    // If set, provides content digests for files covered by an external index
+    // (e.g., a remote gRPC index server). Files whose current digest matches
+    // the external digest are skipped during background indexing.
+    std::function<std::optional<FileDigest>(PathRef)> ExternalDigestProvider =
+        nullptr;
   };
 
   /// Creates a new background index and starts its threads.
@@ -227,6 +232,7 @@ private:
   const GlobalCompilationDatabase &CDB;
   llvm::ThreadPriority IndexingPriority;
   std::function<Context(PathRef)> ContextProvider;
+  std::function<std::optional<FileDigest>(PathRef)> ExternalDigestProvider;
 
   llvm::Error index(tooling::CompileCommand);
 

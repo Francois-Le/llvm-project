@@ -96,6 +96,7 @@ BackgroundIndex::BackgroundIndex(
     : SwapIndex(std::make_unique<MemIndex>()), TFS(TFS), CDB(CDB),
       IndexingPriority(Opts.IndexingPriority),
       ContextProvider(std::move(Opts.ContextProvider)),
+      ExternalDigestProvider(std::move(Opts.ExternalDigestProvider)),
       IndexedSymbols(IndexContents::All, Opts.SupportContainedRefs),
       Rebuilder(this, &IndexedSymbols, Opts.ThreadPoolSize),
       IndexStorageFactory(std::move(IndexStorageFactory)),
@@ -299,8 +300,9 @@ llvm::Error BackgroundIndex::index(tooling::CompileCommand Cmd) {
   SymbolCollector::Options IndexOpts;
   // Creates a filter to not collect index results from files with unchanged
   // digests.
-  IndexOpts.FileFilter = [&ShardVersionsSnapshot](const SourceManager &SM,
-                                                  FileID FID) {
+  IndexOpts.FileFilter = [&ShardVersionsSnapshot,
+                          &ExtDigest = this->ExternalDigestProvider](
+                             const SourceManager &SM, FileID FID) {
     const auto F = SM.getFileEntryRefForID(FID);
     if (!F)
       return false; // Skip invalid files.
@@ -314,6 +316,13 @@ llvm::Error BackgroundIndex::index(tooling::CompileCommand Cmd) {
     if (D != ShardVersionsSnapshot.end() && D->second.Digest == Digest &&
         !D->second.HadErrors)
       return false; // Skip files that haven't changed, without errors.
+    // In Lazy mode, skip files whose digest matches the external index.
+    if (ExtDigest) {
+      if (auto ED = ExtDigest(*AbsPath)) {
+        if (*Digest == *ED)
+          return false;
+      }
+    }
     return true;
   };
   IndexOpts.CollectMainFileRefs = true;
@@ -416,6 +425,21 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
   for (auto &LS : Result) {
     if (!shardIsStale(LS, FS.get()))
       continue;
+    // In Lazy mode, if the external index covers this file at its current
+    // content version, skip local re-indexing — the remote handles it.
+    if (ExternalDigestProvider) {
+      auto Buf = FS->getBufferForFile(LS.AbsolutePath);
+      if (Buf) {
+        FileDigest CurrentDigest = digest(Buf->get()->getBuffer());
+        if (auto ExtDigest = ExternalDigestProvider(LS.AbsolutePath)) {
+          if (CurrentDigest == *ExtDigest) {
+            vlog("Background-index: skipping {0} (covered by external index)",
+                 LS.AbsolutePath);
+            continue;
+          }
+        }
+      }
+    }
     PathRef TUForFile = LS.DependentTU;
     assert(!TUForFile.empty() && "File without a TU!");
 
