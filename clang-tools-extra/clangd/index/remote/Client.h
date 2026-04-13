@@ -11,6 +11,7 @@
 
 #include "SourceCode.h"
 #include "index/Index.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -36,10 +37,13 @@ std::unique_ptr<clangd::SymbolIndex> getClient(llvm::StringRef Address,
 
 /// Fetches per-file content digests from the remote index server.
 /// The returned map keys are absolute local file paths (translated from
-/// server-relative paths using \p IndexRoot). Values are 8-byte content
-/// digests (xxh3_64bits). Returns an empty map on failure.
-llvm::StringMap<FileDigest> fetchFileDigests(llvm::StringRef Address,
-                                             llvm::StringRef IndexRoot);
+/// server-relative paths using \p IndexRoot). Values are lists of 8-byte
+/// content digests (xxh3_64bits). Multiple digests per file arise when
+/// the server is loaded from a shard directory with --keep-shard-history,
+/// allowing clients on different commits to all get cache hits.
+/// Returns an empty map on failure.
+llvm::StringMap<llvm::SmallVector<FileDigest, 2>>
+fetchFileDigests(llvm::StringRef Address, llvm::StringRef IndexRoot);
 
 } // namespace remote
 } // namespace clangd

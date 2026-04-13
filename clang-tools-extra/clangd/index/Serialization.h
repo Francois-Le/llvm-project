@@ -96,6 +96,17 @@ loadIndex(llvm::StringRef Filename, SymbolOrigin Origin, bool UseDex,
           bool SupportContainedRefs,
           std::optional<IncludeGraph> &OutSources);
 
+// Load and merge all .idx shard files from a directory into a single index.
+// This supports shard caches produced by `clangd --build-index`.
+// When multiple versions of the same file exist (e.g., from
+// --keep-shard-history), symbols are merged and all file digests are preserved.
+// OutSources receives the aggregated IncludeGraph with all known digests.
+// Returns nullptr if no valid shards are found.
+std::unique_ptr<SymbolIndex>
+loadIndexFromShardDirectory(llvm::StringRef DirPath, SymbolOrigin Origin,
+                            bool UseDex, bool SupportContainedRefs,
+                            std::optional<IncludeGraph> &OutSources);
+
 } // namespace clangd
 } // namespace clang
 

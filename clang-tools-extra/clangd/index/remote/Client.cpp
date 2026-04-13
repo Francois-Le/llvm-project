@@ -19,6 +19,8 @@
 #include "support/Logger.h"
 #include "support/Trace.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -216,9 +218,9 @@ std::unique_ptr<clangd::SymbolIndex> getClient(llvm::StringRef Address,
       new IndexClient(Channel, Address, ProjectRoot));
 }
 
-llvm::StringMap<FileDigest> fetchFileDigests(llvm::StringRef Address,
-                                             llvm::StringRef IndexRoot) {
-  llvm::StringMap<FileDigest> Result;
+llvm::StringMap<llvm::SmallVector<FileDigest, 2>>
+fetchFileDigests(llvm::StringRef Address, llvm::StringRef IndexRoot) {
+  llvm::StringMap<llvm::SmallVector<FileDigest, 2>> Result;
   const auto Channel =
       grpc::CreateChannel(Address.str(), grpc::InsecureChannelCredentials());
   auto Stub = remote::v1::SymbolIndex::NewStub(Channel);
@@ -254,14 +256,19 @@ llvm::StringMap<FileDigest> fetchFileDigests(llvm::StringRef Address,
     if (Entry.digest().size() == sizeof(FileDigest)) {
       FileDigest D;
       std::memcpy(D.data(), Entry.digest().data(), sizeof(FileDigest));
-      Result[*AbsPath] = D;
+      auto &Digests = Result[*AbsPath];
+      if (!llvm::is_contained(Digests, D))
+        Digests.push_back(D);
     } else {
       log("FileDigests: unexpected digest size for {0}: expected {1}, got {2}",
           Entry.file_path(), sizeof(FileDigest), Entry.digest().size());
     }
   }
-  vlog("Fetched {0} file digests from remote index at {1}", Result.size(),
-       Address);
+  size_t TotalDigests = 0;
+  for (const auto &Entry : Result)
+    TotalDigests += Entry.second.size();
+  vlog("Fetched {0} file digests ({1} total entries) from remote index at {2}",
+       Result.size(), TotalDigests, Address);
   return Result;
 }
 

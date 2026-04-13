@@ -24,6 +24,8 @@
 #include "support/ThreadsafeFS.h"
 #include "support/Trace.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Chrono.h"
 #include "llvm/Support/CommandLine.h"
@@ -60,9 +62,19 @@ namespace {
 static constexpr char Overview[] = R"(
 This is an experimental remote index implementation. The server opens Dex and
 awaits gRPC lookup requests from the client.
+
+The first positional argument can be either:
+  - A monolithic index file (.idx) produced by clangd-indexer, or
+  - A directory containing per-file index shards (.idx files) produced by
+    'clangd --build-index' (optionally with --keep-shard-history).
+
+When a shard directory is specified, the server loads and merges all shards
+into a single queryable index, and serves all known file digests (including
+multiple versions per file for history shards). This enables clients on
+different commits to benefit from the remote index cache.
 )";
 
-llvm::cl::opt<std::string> IndexPath(llvm::cl::desc("<INDEX FILE>"),
+llvm::cl::opt<std::string> IndexPath(llvm::cl::desc("<INDEX FILE OR SHARD DIR>"),
                                      llvm::cl::Positional, llvm::cl::Required);
 
 llvm::cl::opt<std::string> IndexRoot(llvm::cl::desc("<PROJECT ROOT>"),
@@ -128,6 +140,7 @@ public:
   }
 
   /// Update the stored file digests from an IncludeGraph. Thread-safe.
+  /// Replaces all previous digests.
   void updateSources(const IncludeGraph &Sources) {
     std::lock_guard<std::mutex> Lock(SourcesMu);
     FileDigestMap.clear();
@@ -141,9 +154,30 @@ public:
         log("FileDigests: skipping {0}: {1}", Node.URI, RelPath.takeError());
         continue;
       }
-      FileDigestMap[*RelPath] = Node.Digest;
+      auto &Digests = FileDigestMap[*RelPath];
+      if (!llvm::is_contained(Digests, Node.Digest))
+        Digests.push_back(Node.Digest);
     }
     vlog("Updated file digest map with {0} entries", FileDigestMap.size());
+  }
+
+  /// Append file digests from an IncludeGraph without clearing existing ones.
+  /// Use this when loading multiple shards to accumulate all known digests.
+  void appendSources(const IncludeGraph &Sources) {
+    std::lock_guard<std::mutex> Lock(SourcesMu);
+    for (const auto &Entry : Sources) {
+      const IncludeGraphNode &Node = Entry.getValue();
+      if (Node.Digest == FileDigest{{0}})
+        continue;
+      auto RelPath = ProtobufMarshaller->uriToRelativePath(Node.URI);
+      if (!RelPath) {
+        log("FileDigests: skipping {0}: {1}", Node.URI, RelPath.takeError());
+        continue;
+      }
+      auto &Digests = FileDigestMap[*RelPath];
+      if (!llvm::is_contained(Digests, Node.Digest))
+        Digests.push_back(Node.Digest);
+    }
   }
 
 private:
@@ -434,20 +468,24 @@ private:
       if (Request->file_paths_size() == 0) {
         // Return all file digests.
         for (const auto &Entry : FileDigestMap) {
-          auto *E = Reply->add_entries();
-          E->set_file_path(Entry.first());
-          E->set_digest(Entry.second.data(), Entry.second.size());
-          ++Sent;
+          for (const auto &Digest : Entry.second) {
+            auto *E = Reply->add_entries();
+            E->set_file_path(Entry.first());
+            E->set_digest(Digest.data(), Digest.size());
+            ++Sent;
+          }
         }
       } else {
         // Return only requested files.
         for (const auto &Path : Request->file_paths()) {
           auto It = FileDigestMap.find(Path);
           if (It != FileDigestMap.end()) {
-            auto *E = Reply->add_entries();
-            E->set_file_path(It->first());
-            E->set_digest(It->second.data(), It->second.size());
-            ++Sent;
+            for (const auto &Digest : It->second) {
+              auto *E = Reply->add_entries();
+              E->set_file_path(It->first());
+              E->set_digest(Digest.data(), Digest.size());
+              ++Sent;
+            }
           }
         }
       }
@@ -485,7 +523,10 @@ private:
   std::unique_ptr<Marshaller> ProtobufMarshaller;
   clangd::SymbolIndex &Index;
   std::mutex SourcesMu;
-  llvm::StringMap<FileDigest> FileDigestMap;
+  // Maps relative file paths to all known content digests for that file.
+  // Multiple digests per path arise from --keep-shard-history shard
+  // directories, allowing clients on different commits to all get cache hits.
+  llvm::StringMap<llvm::SmallVector<FileDigest, 2>> FileDigestMap;
 };
 
 class Monitor final : public v1::Monitor::Service {
@@ -565,6 +606,82 @@ void hotReload(clangd::SwapIndex &Index, llvm::StringRef IndexPath,
   Monitor.updateIndex(Status->getLastModificationTime());
   log("New index version loaded. Last modification time: {0}, size: {1} bytes.",
       Status->getLastModificationTime(), Status->getSize());
+}
+
+/// A fingerprint of a shard directory, used to detect changes.
+struct DirectoryFingerprint {
+  struct ShardEntry {
+    std::string Path;
+    llvm::sys::TimePoint<> MTime;
+    uint64_t Size;
+    bool operator==(const ShardEntry &O) const {
+      return Path == O.Path && MTime == O.MTime && Size == O.Size;
+    }
+  };
+  std::vector<ShardEntry> Entries;
+  bool operator==(const DirectoryFingerprint &O) const {
+    return Entries == O.Entries;
+  }
+  bool operator!=(const DirectoryFingerprint &O) const {
+    return !(*this == O);
+  }
+};
+
+/// Compute a fingerprint of all .idx files in a directory.
+DirectoryFingerprint
+computeDirectoryFingerprint(
+    llvm::StringRef DirPath,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> &FS) {
+  DirectoryFingerprint FP;
+  std::error_code EC;
+  for (llvm::sys::fs::directory_iterator It(DirPath, EC), End;
+       It != End && !EC; It.increment(EC)) {
+    llvm::StringRef Path = It->path();
+    if (llvm::sys::path::extension(Path) != ".idx")
+      continue;
+    auto Status = FS->status(Path);
+    if (!Status)
+      continue;
+    FP.Entries.push_back({Path.str(), Status->getLastModificationTime(),
+                          Status->getSize()});
+  }
+  llvm::sort(FP.Entries, [](const DirectoryFingerprint::ShardEntry &A,
+                            const DirectoryFingerprint::ShardEntry &B) {
+    return A.Path < B.Path;
+  });
+  return FP;
+}
+
+// Detect changes in a shard directory and reload the merged index.
+void hotReloadDirectory(clangd::SwapIndex &Index, llvm::StringRef DirPath,
+                        DirectoryFingerprint &LastFingerprint,
+                        llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> &FS,
+                        Monitor &Monitor, RemoteIndexServer &Service) {
+  maybeTrimMemory();
+  auto CurrentFP = computeDirectoryFingerprint(DirPath, FS);
+  if (CurrentFP == LastFingerprint)
+    return;
+  vlog("Shard directory {0} changed ({1} shards, was {2}). Reloading.",
+       DirPath, CurrentFP.Entries.size(), LastFingerprint.Entries.size());
+  LastFingerprint = CurrentFP;
+  std::optional<IncludeGraph> Sources;
+  auto NewIndex = clang::clangd::loadIndexFromShardDirectory(
+      DirPath, SymbolOrigin::Static, /*UseDex=*/true,
+      /*SupportContainedRefs=*/true, Sources);
+  if (!NewIndex) {
+    elog("Failed to reload shard directory. Old index will be served.");
+    return;
+  }
+  Index.reset(std::move(NewIndex));
+  if (Sources)
+    Service.updateSources(*Sources);
+  // Use the latest mtime from any shard as the index build time.
+  llvm::sys::TimePoint<> LatestMTime{};
+  for (const auto &E : LastFingerprint.Entries)
+    if (E.MTime > LatestMTime)
+      LatestMTime = E.MTime;
+  Monitor.updateIndex(LatestMTime);
+  log("Shard directory reloaded with {0} shards.", LastFingerprint.Entries.size());
 }
 
 void runServerAndWait(RemoteIndexServer &Service, llvm::StringRef ServerAddress,
@@ -685,16 +802,32 @@ int main(int argc, char *argv[]) {
 
   clang::clangd::RealThreadsafeFS TFS;
   auto FS = TFS.view(std::nullopt);
-  auto Status = FS->status(IndexPath);
-  if (!Status) {
-    elog("{0} does not exist.", IndexPath);
-    return Status.getError().value();
+
+  // Detect whether IndexPath is a directory (shard directory) or a file.
+  bool IsShardDirectory = false;
+  {
+    auto Status = FS->status(IndexPath);
+    if (!Status) {
+      elog("{0} does not exist.", IndexPath);
+      return Status.getError().value();
+    }
+    IsShardDirectory = Status->isDirectory();
   }
 
   std::optional<clang::clangd::IncludeGraph> Sources;
-  auto SymIndex = clang::clangd::loadIndex(
-      IndexPath, clang::clangd::SymbolOrigin::Static, /*UseDex=*/true,
-      /*SupportContainedRefs=*/true, Sources);
+  std::unique_ptr<clang::clangd::SymbolIndex> SymIndex;
+
+  if (IsShardDirectory) {
+    clang::clangd::log("Loading index from shard directory: {0}", IndexPath);
+    SymIndex = clang::clangd::loadIndexFromShardDirectory(
+        IndexPath, clang::clangd::SymbolOrigin::Static, /*UseDex=*/true,
+        /*SupportContainedRefs=*/true, Sources);
+  } else {
+    clang::clangd::log("Loading index from file: {0}", IndexPath);
+    SymIndex = clang::clangd::loadIndex(
+        IndexPath, clang::clangd::SymbolOrigin::Static, /*UseDex=*/true,
+        /*SupportContainedRefs=*/true, Sources);
+  }
   if (!SymIndex) {
     llvm::errs() << "Failed to open the index.\n";
     return -1;
@@ -705,15 +838,38 @@ int main(int argc, char *argv[]) {
   if (Sources)
     Service.updateSources(*Sources);
 
-  Monitor Monitor(Status->getLastModificationTime());
+  // For monitor, use now as initial build time for directories, or file mtime.
+  llvm::sys::TimePoint<> InitialBuildTime;
+  if (IsShardDirectory) {
+    auto FP = computeDirectoryFingerprint(llvm::StringRef(IndexPath), FS);
+    for (const auto &E : FP.Entries)
+      if (E.MTime > InitialBuildTime)
+        InitialBuildTime = E.MTime;
+  } else {
+    auto Status = FS->status(IndexPath);
+    if (Status)
+      InitialBuildTime = Status->getLastModificationTime();
+  }
+  Monitor Monitor(InitialBuildTime);
 
-  std::thread HotReloadThread([&Index, &Status, &FS, &Monitor, &Service]() {
-    llvm::vfs::Status LastStatus = *Status;
+  std::thread HotReloadThread([&Index, &FS, &Monitor, &Service,
+                                IsShardDirectory]() {
     static constexpr auto RefreshFrequency = std::chrono::seconds(30);
-    while (!clang::clangd::shutdownRequested()) {
-      hotReload(Index, llvm::StringRef(IndexPath), LastStatus, FS, Monitor,
-                Service);
-      std::this_thread::sleep_for(RefreshFrequency);
+    if (IsShardDirectory) {
+      auto LastFP = computeDirectoryFingerprint(llvm::StringRef(IndexPath), FS);
+      while (!clang::clangd::shutdownRequested()) {
+        hotReloadDirectory(Index, llvm::StringRef(IndexPath), LastFP, FS,
+                           Monitor, Service);
+        std::this_thread::sleep_for(RefreshFrequency);
+      }
+    } else {
+      auto Status = FS->status(IndexPath);
+      llvm::vfs::Status LastStatus = *Status;
+      while (!clang::clangd::shutdownRequested()) {
+        hotReload(Index, llvm::StringRef(IndexPath), LastStatus, FS, Monitor,
+                  Service);
+        std::this_thread::sleep_for(RefreshFrequency);
+      }
     }
   });
 

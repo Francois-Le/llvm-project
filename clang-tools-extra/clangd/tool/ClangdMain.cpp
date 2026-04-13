@@ -32,7 +32,9 @@
 #include "support/Trace.h"
 #include "clang/Basic/Stack.h"
 #include "clang/Format/Format.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
@@ -961,12 +963,14 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
   // When a remote index is configured and background indexing is enabled,
   // fetch file digests from the remote server so the background indexer can
   // skip files that the remote already covers at the same content version.
-  std::shared_ptr<llvm::StringMap<FileDigest>> RemoteDigests;
+  std::shared_ptr<llvm::StringMap<llvm::SmallVector<FileDigest, 2>>>
+      RemoteDigests;
   if (!RemoteIndexAddress.empty() && EnableBackgroundIndex) {
     auto Digests = remote::fetchFileDigests(RemoteIndexAddress, ProjectRoot);
     if (!Digests.empty()) {
       RemoteDigests =
-          std::make_shared<llvm::StringMap<FileDigest>>(std::move(Digests));
+          std::make_shared<llvm::StringMap<llvm::SmallVector<FileDigest, 2>>>(
+              std::move(Digests));
       log("Fetched {0} file digests from remote index for lazy background "
           "indexing",
           RemoteDigests->size());
@@ -978,12 +982,12 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
   Opts.KeepShardHistory = KeepShardHistory;
 #if CLANGD_ENABLE_REMOTE
   if (RemoteDigests) {
-    Opts.ExternalDigestProvider =
-        [Digests = RemoteDigests](PathRef Path) -> std::optional<FileDigest> {
+    Opts.ExternalDigestChecker =
+        [Digests = RemoteDigests](PathRef Path, FileDigest LocalDigest) -> bool {
       auto It = Digests->find(Path);
-      if (It != Digests->end())
-        return It->second;
-      return std::nullopt;
+      if (It == Digests->end())
+        return false;
+      return llvm::is_contained(It->second, LocalDigest);
     };
     // When using lazy mode with remote index, local shards should NOT use
     // history storage regardless of the --keep-shard-history flag.

@@ -131,10 +131,10 @@ public:
     /// If true, keep index shards for all file versions (content-addressed).
     bool KeepShardHistory = false;
 
-    /// If set, provides content digests for files covered by an external index
-    /// (e.g., a remote gRPC index server). Background indexing will skip files
-    /// whose current content matches the external digest.
-    std::function<std::optional<FileDigest>(PathRef)> ExternalDigestProvider;
+    /// If set, checks whether a file at a given path with a given content
+    /// digest is covered by an external index (e.g., a remote gRPC index
+    /// server). Background indexing will skip files where this returns true.
+    std::function<bool(PathRef, FileDigest)> ExternalDigestChecker;
 
     /// If set, use this index to augment code completion results.
     SymbolIndex *StaticIndex = nullptr;

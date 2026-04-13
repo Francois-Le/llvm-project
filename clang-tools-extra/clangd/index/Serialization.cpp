@@ -10,6 +10,7 @@
 #include "Headers.h"
 #include "RIFF.h"
 #include "URI.h"
+#include "index/Merge.h"
 #include "index/MemIndex.h"
 #include "index/SymbolLocation.h"
 #include "index/SymbolOrigin.h"
@@ -17,11 +18,14 @@
 #include "support/Logger.h"
 #include "support/Trace.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Compression.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/StringSaver.h"
 #include "llvm/Support/raw_ostream.h"
@@ -863,6 +867,137 @@ loadIndex(llvm::StringRef SymbolFilename, SymbolOrigin Origin, bool UseDex,
        "  - number of refs: {4}\n"
        "  - number of relations: {5}",
        UseDex ? "Dex" : "MemIndex", SymbolFilename,
+       Index->estimateMemoryUsage(), NumSym, NumRefs, NumRelations);
+  return Index;
+}
+
+std::unique_ptr<SymbolIndex>
+loadIndexFromShardDirectory(llvm::StringRef DirPath, SymbolOrigin Origin,
+                            bool UseDex, bool SupportContainedRefs,
+                            std::optional<IncludeGraph> &OutSources) {
+  trace::Span OverallTracer("LoadIndexFromShardDirectory");
+
+  // Enumerate all .idx files in the directory.
+  std::error_code EC;
+  std::vector<std::string> ShardPaths;
+  for (llvm::sys::fs::directory_iterator It(DirPath, EC), End;
+       It != End && !EC; It.increment(EC)) {
+    llvm::StringRef Path = It->path();
+    if (llvm::sys::path::extension(Path) == ".idx")
+      ShardPaths.push_back(Path.str());
+  }
+  if (EC) {
+    elog("Error listing shard directory {0}: {1}", DirPath, EC.message());
+    return nullptr;
+  }
+  if (ShardPaths.empty()) {
+    elog("No .idx files found in shard directory {0}", DirPath);
+    return nullptr;
+  }
+
+  // Sort for deterministic load order.
+  llvm::sort(ShardPaths);
+
+  // Merge all shards. We keep all parsed IndexFileIn objects alive because
+  // Symbol/Ref/Relation objects contain StringRefs into their storage.
+  std::vector<IndexFileIn> ParsedShards;
+  llvm::DenseMap<SymbolID, Symbol> MergedSymbols;
+  llvm::DenseMap<SymbolID, llvm::SmallVector<Ref, 4>> MergedRefs;
+  std::vector<Relation> MergedRelations;
+  IncludeGraph MergedSources;
+
+  unsigned ValidShards = 0;
+  {
+    trace::Span Tracer("ParseAndMergeShards");
+    for (const auto &ShardPath : ShardPaths) {
+      auto Buffer = llvm::MemoryBuffer::getFile(ShardPath);
+      if (!Buffer) {
+        log("Skipping shard {0}: {1}", ShardPath, Buffer.getError().message());
+        continue;
+      }
+      auto I = readIndexFile(Buffer->get()->getBuffer(), Origin);
+      if (!I) {
+        log("Skipping bad shard {0}: {1}", ShardPath,
+            llvm::toString(I.takeError()));
+        continue;
+      }
+      ++ValidShards;
+      ParsedShards.push_back(std::move(*I));
+      const auto &Shard = ParsedShards.back();
+
+      if (Shard.Symbols) {
+        for (const auto &Sym : *Shard.Symbols) {
+          auto It = MergedSymbols.try_emplace(Sym.ID, Sym);
+          if (!It.second)
+            It.first->second = mergeSymbol(It.first->second, Sym);
+        }
+      }
+      if (Shard.Refs) {
+        for (const auto &SymRefs : *Shard.Refs)
+          MergedRefs[SymRefs.first].append(SymRefs.second.begin(),
+                                           SymRefs.second.end());
+      }
+      if (Shard.Relations) {
+        for (const auto &Rel : *Shard.Relations)
+          MergedRelations.push_back(Rel);
+      }
+      if (Shard.Sources) {
+        for (const auto &Entry : *Shard.Sources) {
+          // Keep all unique source entries. If the same URI appears in multiple
+          // shards (e.g., from --keep-shard-history with different content
+          // versions), the last one wins for the IncludeGraph node data, but
+          // all digests are preserved via the multi-digest FileDigestMap on the
+          // server side.
+          MergedSources[Entry.getKey()] = Entry.getValue();
+        }
+      }
+    }
+  }
+
+  if (ValidShards == 0) {
+    elog("No valid shards found in directory {0}", DirPath);
+    return nullptr;
+  }
+
+  // Build symbol slab.
+  SymbolSlab::Builder SymBuilder;
+  for (auto &Entry : MergedSymbols)
+    SymBuilder.insert(Entry.second);
+  SymbolSlab Symbols = std::move(SymBuilder).build();
+
+  // Build ref slab.
+  RefSlab::Builder RefBuilder;
+  for (auto &Entry : MergedRefs) {
+    llvm::sort(Entry.second);
+    for (const auto &R : Entry.second)
+      RefBuilder.insert(Entry.first, R);
+  }
+  RefSlab Refs = std::move(RefBuilder).build();
+
+  // Build relation slab.
+  RelationSlab::Builder RelBuilder;
+  for (const auto &Rel : MergedRelations)
+    RelBuilder.insert(Rel);
+  RelationSlab Relations = std::move(RelBuilder).build();
+
+  OutSources = std::move(MergedSources);
+
+  size_t NumSym = Symbols.size();
+  size_t NumRefs = Refs.numRefs();
+  size_t NumRelations = Relations.size();
+
+  trace::Span Tracer("BuildIndex");
+  auto Index = UseDex
+                   ? dex::Dex::build(std::move(Symbols), std::move(Refs),
+                                     std::move(Relations), SupportContainedRefs)
+                   : MemIndex::build(std::move(Symbols), std::move(Refs),
+                                     std::move(Relations));
+  vlog("Loaded {0} from {1} shards in {2} with estimated memory usage {3} "
+       "bytes\n"
+       "  - number of symbols: {4}\n"
+       "  - number of refs: {5}\n"
+       "  - number of relations: {6}",
+       UseDex ? "Dex" : "MemIndex", ValidShards, DirPath,
        Index->estimateMemoryUsage(), NumSym, NumRefs, NumRelations);
   return Index;
 }

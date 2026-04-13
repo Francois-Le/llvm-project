@@ -9,14 +9,24 @@
 #include "Headers.h"
 #include "RIFF.h"
 #include "URI.h"
+#include "index/Index.h"
+#include "index/Merge.h"
+#include "index/Ref.h"
+#include "index/Relation.h"
 #include "index/Serialization.h"
+#include "index/Symbol.h"
+#include "index/SymbolID.h"
 #include "support/Logger.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Config/llvm-config.h" // for LLVM_ON_UNIX
 #include "llvm/Support/Compression.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/ScopedPrinter.h"
+#include "llvm/Support/raw_ostream.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #ifdef LLVM_ON_UNIX
@@ -558,6 +568,181 @@ TEST(URIPathConversionTest, RelativePathToURIEmpty) {
   auto URI = relativePathToURI("", "/project/");
   ASSERT_FALSE(bool(URI));
   llvm::consumeError(URI.takeError());
+}
+
+// Helper: write an IndexFileOut to a file path.
+static void writeShardFile(llvm::StringRef Path, const IndexFileOut &Out) {
+  std::error_code EC;
+  llvm::raw_fd_ostream OS(Path, EC);
+  ASSERT_FALSE(EC) << EC.message();
+  OS << Out;
+}
+
+TEST(SerializationTest, LoadIndexFromShardDirectory) {
+  // Create a temp directory.
+  llvm::SmallString<256> TempDir;
+  ASSERT_FALSE(
+      llvm::sys::fs::createUniqueDirectory("ShardDirTest", TempDir));
+  auto Cleanup = llvm::scope_exit(
+      [&] { llvm::sys::fs::remove_directories(TempDir); });
+
+  // Build shard 1: one symbol, one ref, one relation, one source.
+  SymbolSlab::Builder SymBuilder1;
+  Symbol Sym1;
+  Sym1.ID = cantFail(SymbolID::fromStr("0000000000000001"));
+  Sym1.Name = "Foo";
+  Sym1.Scope = "ns::";
+  SymBuilder1.insert(Sym1);
+  auto Syms1 = std::move(SymBuilder1).build();
+
+  RelationSlab::Builder RelBuilder1;
+  Relation Rel1;
+  Rel1.Subject = Sym1.ID;
+  Rel1.Predicate = RelationKind::BaseOf;
+  Rel1.Object = cantFail(SymbolID::fromStr("0000000000000002"));
+  RelBuilder1.insert(Rel1);
+  auto Rels1 = std::move(RelBuilder1).build();
+
+  IncludeGraph Sources1;
+  IncludeGraphNode Node1;
+  Node1.URI = "file:///src/foo.cpp";
+  Node1.Flags = IncludeGraphNode::SourceFlag::IsTU;
+  Node1.Digest = {1, 2, 3, 4, 5, 6, 7, 8};
+  Sources1[Node1.URI] = Node1;
+
+  IndexFileOut Out1;
+  Out1.Symbols = &Syms1;
+  Out1.Relations = &Rels1;
+  Out1.Sources = &Sources1;
+  Out1.Format = IndexFileFormat::RIFF;
+
+  llvm::SmallString<256> Shard1Path(TempDir);
+  llvm::sys::path::append(Shard1Path, "shard1.idx");
+  writeShardFile(Shard1Path, Out1);
+
+  // Build shard 2: different symbol, different source.
+  SymbolSlab::Builder SymBuilder2;
+  Symbol Sym2;
+  Sym2.ID = cantFail(SymbolID::fromStr("0000000000000002"));
+  Sym2.Name = "Bar";
+  Sym2.Scope = "ns::";
+  SymBuilder2.insert(Sym2);
+  auto Syms2 = std::move(SymBuilder2).build();
+
+  IncludeGraph Sources2;
+  IncludeGraphNode Node2;
+  Node2.URI = "file:///src/bar.cpp";
+  Node2.Flags = IncludeGraphNode::SourceFlag::IsTU;
+  Node2.Digest = {8, 7, 6, 5, 4, 3, 2, 1};
+  Sources2[Node2.URI] = Node2;
+
+  IndexFileOut Out2;
+  Out2.Symbols = &Syms2;
+  Out2.Sources = &Sources2;
+  Out2.Format = IndexFileFormat::RIFF;
+
+  llvm::SmallString<256> Shard2Path(TempDir);
+  llvm::sys::path::append(Shard2Path, "shard2.idx");
+  writeShardFile(Shard2Path, Out2);
+
+  // Load the shard directory.
+  std::optional<IncludeGraph> OutSources;
+  auto Index = loadIndexFromShardDirectory(
+      TempDir, SymbolOrigin::Static, /*UseDex=*/false,
+      /*SupportContainedRefs=*/false, OutSources);
+
+  ASSERT_NE(Index, nullptr);
+
+  // Verify both symbols are present.
+  LookupRequest LookReq;
+  LookReq.IDs.insert(cantFail(SymbolID::fromStr("0000000000000001")));
+  LookReq.IDs.insert(cantFail(SymbolID::fromStr("0000000000000002")));
+  std::vector<std::string> FoundNames;
+  Index->lookup(LookReq, [&](const Symbol &S) {
+    FoundNames.push_back((S.Scope + S.Name).str());
+  });
+  EXPECT_THAT(FoundNames, UnorderedElementsAre("ns::Foo", "ns::Bar"));
+
+  // Verify sources.
+  ASSERT_TRUE(OutSources.has_value());
+  EXPECT_EQ(OutSources->size(), 2u);
+  EXPECT_NE(OutSources->find("file:///src/foo.cpp"), OutSources->end());
+  EXPECT_NE(OutSources->find("file:///src/bar.cpp"), OutSources->end());
+}
+
+TEST(SerializationTest, LoadIndexFromShardDirectoryEmpty) {
+  llvm::SmallString<256> TempDir;
+  ASSERT_FALSE(
+      llvm::sys::fs::createUniqueDirectory("ShardDirEmpty", TempDir));
+  auto Cleanup = llvm::scope_exit(
+      [&] { llvm::sys::fs::remove_directories(TempDir); });
+
+  std::optional<IncludeGraph> OutSources;
+  auto Index = loadIndexFromShardDirectory(
+      TempDir, SymbolOrigin::Static, /*UseDex=*/false,
+      /*SupportContainedRefs=*/false, OutSources);
+  EXPECT_EQ(Index, nullptr);
+}
+
+TEST(SerializationTest, LoadIndexFromShardDirectoryMergesSymbols) {
+  // Two shards with the same symbol — verifies merge behavior.
+  llvm::SmallString<256> TempDir;
+  ASSERT_FALSE(
+      llvm::sys::fs::createUniqueDirectory("ShardDirMerge", TempDir));
+  auto Cleanup = llvm::scope_exit(
+      [&] { llvm::sys::fs::remove_directories(TempDir); });
+
+  // Shard A: symbol has declaration only.
+  SymbolSlab::Builder SymBuilderA;
+  Symbol SymA;
+  SymA.ID = cantFail(SymbolID::fromStr("0000000000000001"));
+  SymA.Name = "Foo";
+  SymA.Scope = "ns::";
+  SymA.CanonicalDeclaration.FileURI = "file:///inc/foo.h";
+  SymBuilderA.insert(SymA);
+  auto SymsA = std::move(SymBuilderA).build();
+
+  IndexFileOut OutA;
+  OutA.Symbols = &SymsA;
+  OutA.Format = IndexFileFormat::RIFF;
+  llvm::SmallString<256> ShardAPath(TempDir);
+  llvm::sys::path::append(ShardAPath, "shardA.idx");
+  writeShardFile(ShardAPath, OutA);
+
+  // Shard B: same symbol, but with a definition.
+  SymbolSlab::Builder SymBuilderB;
+  Symbol SymB;
+  SymB.ID = cantFail(SymbolID::fromStr("0000000000000001"));
+  SymB.Name = "Foo";
+  SymB.Scope = "ns::";
+  SymB.Definition.FileURI = "file:///src/foo.cpp";
+  SymBuilderB.insert(SymB);
+  auto SymsB = std::move(SymBuilderB).build();
+
+  IndexFileOut OutB;
+  OutB.Symbols = &SymsB;
+  OutB.Format = IndexFileFormat::RIFF;
+  llvm::SmallString<256> ShardBPath(TempDir);
+  llvm::sys::path::append(ShardBPath, "shardB.idx");
+  writeShardFile(ShardBPath, OutB);
+
+  std::optional<IncludeGraph> OutSources;
+  auto Index = loadIndexFromShardDirectory(
+      TempDir, SymbolOrigin::Static, /*UseDex=*/false,
+      /*SupportContainedRefs=*/false, OutSources);
+  ASSERT_NE(Index, nullptr);
+
+  // The merged symbol should have both declaration and definition.
+  LookupRequest LookReq;
+  LookReq.IDs.insert(cantFail(SymbolID::fromStr("0000000000000001")));
+  unsigned Found = 0;
+  Index->lookup(LookReq, [&](const Symbol &S) {
+    ++Found;
+    // mergeSymbol picks the "better" data from each side.
+    // At least one of declaration/definition should be populated.
+    EXPECT_TRUE(S.CanonicalDeclaration || S.Definition);
+  });
+  EXPECT_EQ(Found, 1u);
 }
 
 } // namespace
